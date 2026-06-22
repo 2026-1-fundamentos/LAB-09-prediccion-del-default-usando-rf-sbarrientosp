@@ -92,3 +92,182 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import json
+import gzip
+import pickle
+import zipfile
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    make_scorer, 
+    balanced_accuracy_score, 
+    precision_score, 
+    recall_score, 
+    f1_score, 
+    confusion_matrix
+)
+from sklearn.impute import SimpleImputer
+
+#Paso 1. Carga y limpieza de datos
+def clean_dataset(path):
+    """
+    Carga y limpia el dataset optimizando memoria y velocidad.
+    """
+    # Verificación básica de existencia
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"El archivo no existe: {path}")
+
+    with zipfile.ZipFile(path, "r") as z:
+        csv_file = z.namelist()[0]
+        with z.open(csv_file) as f:
+            # Optimización: No cargar la columna ID para ahorrar memoria
+            df = pd.read_csv(f, usecols=lambda col: col != "ID")
+
+    # Encadenamiento de métodos para limpieza
+    df = (df
+          .rename(columns={"default payment next month": "default"})
+          .dropna()
+    )
+
+    df["EDUCATION"] = df["EDUCATION"].clip(upper=4)
+
+    return df
+
+#Paso 2. Construcción del Pipeline
+def build_pipeline():
+    """
+    Construye un pipeline robusto con manejo de nulos y Random Forest.
+    """
+    categorical_features = ["EDUCATION", "MARRIAGE", "SEX"]
+
+    # Pipeline para categóricas: Imputación (seguridad) + OneHot
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('encoder', OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[("cat", categorical_transformer, categorical_features)],
+        remainder="passthrough",
+    )
+
+    # RandomForest base
+    random_forest_model = RandomForestClassifier(random_state=42)
+
+    pipeline = Pipeline(
+        steps=[("preprocessor", preprocessor), ("classifier", random_forest_model)]
+    )
+
+    return pipeline
+
+#Paso 3. Optimización de Hiperparámetros
+def optimize_pipeline(pipeline, x_train, y_train):
+    """
+    Optimiza el pipeline usando GridSearchCV.
+    """
+    scoring = make_scorer(balanced_accuracy_score)
+
+    param_grid = {
+        "classifier__n_estimators": [50, 100, 200],
+        "classifier__max_depth": [None, 5, 10, 20],
+        "classifier__min_samples_split": [2, 5, 10],
+        "classifier__min_samples_leaf": [1, 2, 4],
+    }
+
+    # n_jobs=-1 usa todos los núcleos para acelerar la búsqueda
+    grid_search = GridSearchCV(
+        pipeline,
+        param_grid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        verbose=2,
+    )
+
+    print("Iniciando optimización de hiperparámetros...")
+    grid_search.fit(x_train, y_train)
+    print(f"Mejores parámetros encontrados: {grid_search.best_params_}")
+
+    return grid_search
+
+#Paso 4. Guardar Modelo y Evaluar Métricas
+def save_model(model, file_path="files/models/model.pkl.gz"):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    with gzip.open(file_path, "wb") as f:
+        pickle.dump(model, f)
+
+    print(f"Modelo guardado exitosamente en: {file_path}")
+
+def evaluate_model(model, x_train, y_train, x_test, y_test, file_path="files/output/metrics.json"):
+    """
+    Calcula métricas y las guarda en JSON.
+    """
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    # Predicciones
+    y_train_pred = model.predict(x_train)
+    y_test_pred = model.predict(x_test)
+
+    def get_metrics(y_true, y_pred, dataset_name):
+        return {
+            "type": "metrics",
+            "dataset": dataset_name,
+            "precision": precision_score(y_true, y_pred, zero_division=0),
+            "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+            "recall": recall_score(y_true, y_pred, zero_division=0),
+            "f1_score": f1_score(y_true, y_pred, zero_division=0),
+        }
+
+    def get_confusion_matrix_dict(y_true, y_pred, dataset_name):
+        cm = confusion_matrix(y_true, y_pred)
+        return {
+            "type": "cm_matrix",
+            "dataset": dataset_name,
+            "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+            "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+        }
+
+    # Recopilar resultados
+    results = [
+        get_metrics(y_train, y_train_pred, "train"),
+        get_metrics(y_test, y_test_pred, "test"),
+        get_confusion_matrix_dict(y_train, y_train_pred, "train"),
+        get_confusion_matrix_dict(y_test, y_test_pred, "test")
+    ]
+
+    # Guardar en archivo (formato JSON lines)
+    with open(file_path, "w") as f:
+        for result in results:
+            f.write(json.dumps(result) + "\n")
+
+    print(f"Métricas guardadas en: {file_path}")
+
+#Paso 5. Ejecución Principal
+if __name__ == "__main__":
+    # Configuración de rutas
+    TRAIN_PATH = "./files/input/train_data.csv.zip"
+    TEST_PATH = "./files/input/test_data.csv.zip"
+    MODEL_PATH = "./files/models/model.pkl.gz"
+    METRICS_PATH = "./files/output/metrics.json"
+
+    df_train = clean_dataset(TRAIN_PATH)
+    df_test = clean_dataset(TEST_PATH)
+
+    x_train = df_train.drop(columns=["default"])
+    y_train = df_train["default"]
+    x_test = df_test.drop(columns=["default"])
+    y_test = df_test["default"]
+
+    pipeline = build_pipeline()
+    best_model = optimize_pipeline(pipeline, x_train, y_train)
+    evaluate_model(best_model, x_train, y_train, x_test, y_test, METRICS_PATH)
+
+    save_model(best_model, MODEL_PATH)
